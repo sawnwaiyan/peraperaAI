@@ -1,0 +1,1 @@
+# core package — shared infrastructure (database, security, dependencies, exceptions)
