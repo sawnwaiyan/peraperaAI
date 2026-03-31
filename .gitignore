@@ -1,0 +1,30 @@
+# Environment files — never commit real secrets
+backend/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Alembic (generated versions are committed, but not cache)
+alembic/__pycache__/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker volumes (local data, not code)
+pgdata/
