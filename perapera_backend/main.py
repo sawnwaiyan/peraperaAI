@@ -1,26 +1,34 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
+from routers import auth
+# from routers import users        # Week 4
+# from routers import missions     # Week 2
+# from routers import results      # Week 2
+# from routers import voice        # Week 3
+# from routers import openai_proxy # Week 4
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Alembic handles all table creation — nothing needed here on startup
+    # Table creation is handled by Alembic — no create_all here.
     yield
 
 
 app = FastAPI(
-    title="AI English App API",
+    title="PeraperaAI — Backend API",
     version="1.0.0",
-    description="Backend for AI English Learning App",
+    description="AI English learning app for Japanese users.",
     lifespan=lifespan,
 )
 
-# ── Routers added here as each feature is built ──
-# from routers import auth
-# app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+# ── Routers ───────────────────────────────────────────────────────────────────
+
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 
 
-@app.get("/health")
+# ── Health check ──────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["health"])
 async def health():
-    """Health check — confirms API and DB connection are alive."""
-    return {"status": "ok", "message": "AI English App API is running"}
+    return {"status": "ok"}
