@@ -1,16 +1,17 @@
 """
 onboarding_service.py
-Handles two OpenAI calls:
+Handles two Gemini calls:
   1. onboarding interview chat (B2) — multi-turn, stateless
   2. mission generation (B3)        — single call, returns JSON array
 
-Both always use the developer's OPENAI_DEV_API_KEY (free sessions).
+Uses the official google-genai SDK (same as Google's sample code).
 """
 
 import json
 import re
-import httpx
 from fastapi import HTTPException, status
+from google import genai
+from google.genai import types
 
 from config import get_settings
 from schemas.mission import (
@@ -21,50 +22,68 @@ from schemas.mission import (
 
 settings = get_settings()
 
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-MODEL = "gpt-4o-mini"
+MODEL = "gemini-2.5-flash-lite"
 
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 
 INTERVIEW_SYSTEM_PROMPT = """\
 You are a friendly interview assistant for PeraperaAI, a Japanese English learning app.
-Interview the user in Japanese to learn their goal and English level. Follow these steps IN ORDER:
+Interview the user in Japanese to learn their goal and English level.
 
-STEP 1 — Goal
+Follow these 5 steps IN ORDER. Complete every step exactly once, then stop.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Goal detection
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Ask: 「英語を使いたい場面はどんなところですか？」
-(Offer examples: 海外旅行 / 仕事・ビジネス / 留学準備 / 日常会話 / 試験対策)
+Offer examples: 海外旅行 / 仕事・ビジネス / 留学準備 / 日常会話 / 試験対策
 
-STEP 2 — Goal detail
-Based on their answer, ask one follow-up to narrow down the specific situation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Goal narrowing
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Ask one follow-up to find the specific situation.
 Example if travel: 「レストランで注文？ホテルのチェックイン？道を聞く？」
 
-STEP 3 — Level check (switch to English for THIS message only)
-Say in English: "By the way, can you tell me a little about yourself in English? \
-Just 1–2 sentences is fine! 😊"
-Add Japanese hint below: 「簡単な英語で自己紹介してみてください！」
-Internally assess their reply → map to: beginner / elementary / intermediate / upper_intermediate
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — English level check  ← switch to English for THIS message only
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Say exactly: "By the way, can you tell me a little about yourself in English? Just 1-2 sentences is fine!"
+Add below: 「簡単な英語で自己紹介してみてください！」
+
+Internally map their reply to ONE of: beginner / elementary / intermediate / upper_intermediate
   beginner:           very simple phrases, many errors, tiny vocabulary
   elementary:         basic sentences, clear errors, limited vocabulary
   intermediate:       decent sentences, some errors, reasonable vocabulary
   upper_intermediate: complex sentences, few errors, good vocabulary
 
-STEP 4 — Comfort check (back to Japanese)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — Speaking comfort  ← back to Japanese
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Ask: 「英語を声に出して練習するのは得意ですか？苦手ですか？」
-(Hints: 「得意！」「まあまあ」「苦手…」)
+Hints: 「得意！」「まあまあ」「苦手…」
+Map answer to: comfortable / neutral / uncomfortable
 
-STEP 5 — Summary
-Summarise in Japanese: goal + level impression + say missions are being prepared.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — Summary + REQUIRED completion output
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Write a warm 2-3 sentence Japanese summary of: goal + level impression + missions incoming.
 Example: 「わかりました！海外旅行での英語を練習しましょう。初中級レベルに合わせたミッションを作りますね！」
 
-RULES:
-- Stay in Japanese except Step 3
-- Be warm and encouraging; keep replies to 2–4 sentences
-- Do NOT skip or reorder steps
-- Do NOT add the completion signal until AFTER step 5 summary
+Then, ON THE VERY NEXT LINE with NO other text between them, output the completion block:
 
-COMPLETION SIGNAL — output exactly this after your Step 5 message, on its own line:
 __INTERVIEW_COMPLETE__
 {"primary_goal":"<goal>","goal_detail":"<detail>","english_level":"<level>","speaking_comfort":"<comfortable|neutral|uncomfortable>"}
+
+The completion block is MANDATORY. Step 5 is not finished until you output it.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GENERAL RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Stay in Japanese for all steps except Step 3
+- Be warm and encouraging; keep each reply to 2-4 sentences
+- Do NOT skip or reorder steps
+- Do NOT output __INTERVIEW_COMPLETE__ before Step 5
+- Do NOT add any text after the JSON on the completion line
 """
 
 MISSION_GENERATION_SYSTEM_PROMPT = """\
@@ -77,63 +96,91 @@ Each mission object:
 {
   "title_en": "Short English title (max 8 words)",
   "title_ja": "Japanese translation",
-  "description": "Scene description in Japanese (2–3 sentences, sets the scene vividly)",
-  "difficulty_level": <1–5 integer>,
+  "description": "Scene description in Japanese (2-3 sentences, sets the scene vividly)",
+  "difficulty_level": <1-5 integer>,
   "key_phrases": [{"en": "phrase", "ja": "translation"}, ...],
   "vocabulary": [{"word": "word", "pronunciation_hint": "katakana + IPA", "ja": "translation"}, ...],
   "dialogue_preview": [{"speaker": "ai", "text": "..."}, {"speaker": "user_example", "text": "..."}, ...],
   "objectives": ["objective in English", ...],
   "ai_role": "AI character description in English",
   "user_role": "User role description in Japanese",
-  "system_prompt": "Full English system prompt for the AI character during role-play (3–5 sentences, \
-sets personality + constraints)"
+  "system_prompt": "Full English system prompt for the AI character during role-play (3-5 sentences)"
 }
 
 DIFFICULTY GUIDE:
-  beginner → 1–2   (very short sentences, basic vocab, slow pace)
-  elementary → 2–3
-  intermediate → 3–4
-  upper_intermediate → 4–5
+  beginner -> 1-2   (very short sentences, basic vocab, slow pace)
+  elementary -> 2-3
+  intermediate -> 3-4
+  upper_intermediate -> 4-5
 
 QUALITY RULES:
 - Scenarios must feel real and specific (not generic)
-- key_phrases: 4–6, directly useful for the scenario
-- vocabulary: 5–8 words the user WILL encounter
-- dialogue_preview: 3–4 exchanges showing realistic flow
-- objectives: 2–4 concrete tasks the user must complete
-- system_prompt: make the AI character behave realistically (correct pace, helpful hints if stuck)
+- key_phrases: 4-6, directly useful for the scenario
+- vocabulary: 5-8 words the user WILL encounter
+- dialogue_preview: 3-4 exchanges showing realistic flow
+- objectives: 2-4 concrete tasks the user must complete
+- system_prompt: make the AI character behave realistically
 """
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async def _call_openai(messages: list[dict], max_tokens: int = 800) -> str:
-    """Raw OpenAI call using developer key. Returns the assistant text."""
-    headers = {
-        "Authorization": f"Bearer {settings.openai_dev_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.7,
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
+def _build_contents(messages: list[dict]) -> list[types.Content]:
+    """
+    Convert message dicts to Gemini SDK Content objects.
+    Skips system messages (passed separately via config).
+    Gemini uses "model" instead of "assistant".
+    """
+    contents = []
+    for msg in messages:
+        if msg["role"] == "system":
+            continue
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append(
+            types.Content(
+                role=role,
+                parts=[types.Part(text=msg["content"])],
+            )
+        )
+    return contents
 
-    if resp.status_code != 200:
+
+async def _call_gemini(
+    messages: list[dict],
+    system_prompt: str,
+    max_tokens: int = 800,
+) -> str:
+    """
+    Call Gemini using the official google-genai SDK.
+    system_prompt is passed separately via GenerateContentConfig.
+    """
+    client = genai.Client(api_key=settings.gemini_api_key)
+    contents = _build_contents(messages)
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=max_tokens,
+        temperature=0.7,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+            config=config,
+        )
+        return response.text
+    except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"OpenAI APIエラー: {resp.status_code}",
+            detail=f"Gemini APIエラー: {str(e)}",
         )
-    return resp.json()["choices"][0]["message"]["content"]
 
 
 def _parse_completion(text: str) -> tuple[str, OnboardingData | None]:
     """
     Splits the AI reply into (clean_message, extracted_data | None).
-    Looks for __INTERVIEW_COMPLETE__ marker followed by a JSON line.
+    Looks for __INTERVIEW_COMPLETE__ marker followed by a JSON object.
     """
     marker = "__INTERVIEW_COMPLETE__"
     if marker not in text:
@@ -143,7 +190,6 @@ def _parse_completion(text: str) -> tuple[str, OnboardingData | None]:
     clean_message = parts[0].strip()
     json_part = parts[1].strip()
 
-    # Extract first JSON object from whatever follows the marker
     match = re.search(r"\{.*\}", json_part, re.DOTALL)
     if not match:
         return clean_message, None
@@ -159,16 +205,18 @@ def _parse_completion(text: str) -> tuple[str, OnboardingData | None]:
 
 async def run_interview_turn(req: OnboardingChatRequest) -> OnboardingChatResponse:
     """Single turn of the onboarding interview (B2). Client calls repeatedly."""
-    messages: list[dict] = [{"role": "system", "content": INTERVIEW_SYSTEM_PROMPT}]
+    messages: list[dict] = []
 
-    # Replay history
     for msg in req.messages:
         messages.append({"role": msg.role, "content": msg.content})
 
-    # Append new user message
     messages.append({"role": "user", "content": req.user_message})
 
-    raw = await _call_openai(messages, max_tokens=600)
+    raw = await _call_gemini(
+        messages=messages,
+        system_prompt=INTERVIEW_SYSTEM_PROMPT,
+        max_tokens=600,
+    )
     clean, extracted = _parse_completion(raw)
 
     return OnboardingChatResponse(
@@ -186,8 +234,9 @@ async def generate_missions_from_openai(
     count: int,
 ) -> list[dict]:
     """
-    Call GPT to generate `count` missions. Returns raw list of dicts.
+    Generate `count` missions via Gemini. Returns raw list of dicts.
     Caller (mission_service) persists them to DB.
+    Function name kept as-is to avoid changing mission_service.py.
     """
     user_prompt = (
         f"User profile:\n"
@@ -197,13 +246,14 @@ async def generate_missions_from_openai(
         f"- Speaking comfort: {speaking_comfort}\n\n"
         f"Generate exactly {count} missions as a JSON array."
     )
-    messages = [
-        {"role": "system", "content": MISSION_GENERATION_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-    raw = await _call_openai(messages, max_tokens=2000)
+    messages = [{"role": "user", "content": user_prompt}]
 
-    # Strip any accidental markdown fences
+    raw = await _call_gemini(
+        messages=messages,
+        system_prompt=MISSION_GENERATION_SYSTEM_PROMPT,
+        max_tokens=8192,
+    )
+
     cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
     try:
         missions = json.loads(cleaned)
