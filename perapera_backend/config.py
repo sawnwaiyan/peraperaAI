@@ -13,7 +13,8 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
 
     # OpenAI (developer key — used for free sessions, proxied via backend)
-    openai_dev_api_key: str = ""
+    #openai_dev_api_key: str = ""
+    gemini_api_key: str = ""
 
     # Free session limits (set at registration based on age group)
     free_sessions_adult: int = 5
