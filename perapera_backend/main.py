@@ -2,8 +2,9 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
 from routers import auth
+from routers import missions     # Week 2
 # from routers import users        # Week 4
-# from routers import missions     # Week 2
+
 # from routers import results      # Week 2
 # from routers import voice        # Week 3
 # from routers import openai_proxy # Week 4
@@ -25,7 +26,7 @@ app = FastAPI(
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
-
+app.include_router(missions.router, prefix="/api/v1/missions", tags=["missions"])
 
 # ── Health check ──────────────────────────────────────────────────────────────
 
